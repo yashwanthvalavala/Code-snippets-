@@ -1,62 +1,262 @@
+from airflow.operators.python import BranchPythonOperator
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+from airflow import DAG
+import sys
+import os
+import copy
+import boto3
 import pandas as pd
 from io import StringIO
 
+# Adding the parent directory of dags and pipeline to sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-def load_historical_from_s3(s3_client, bucket, key):
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    csv_content = response['Body'].read().decode('utf-8')
-    df = pd.read_csv(StringIO(csv_content))
-    return df
+from pipeline.search_pipeline.GoogleSearch import GoogleTrendsNew as dc_search_google
+from pipeline.search_pipeline.GoogleSearchOverlap import GoogleTrendsNew as dc_search_google_overlap
+from pipeline.search_pipeline.GoogleSearchQA import SearchValidate as dc_search_qa
+from pipeline.helper.utils.constants import SPECIAL_CATEGORIES
+from pipeline.extrapolation import extrapolate_and_compare, load_historical_from_s3
 
 
-def extrapolate_and_compare(
-    current_df,
-    historical_df,
-    date_column="timestamp",
-    value_column="monthly_engagement_score",
-    key_columns=None,
-    window=3
-):
+default_args = {
+    "owner": "data_engineering_team",
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "email": "dataengg@aipalette.com",
+    "depends_on_past": False,
+    "retries": 0,
+    "retry_delay": timedelta(minutes=1)
+}
 
-    if key_columns is None:
-        raise ValueError("key_columns must be provided")
+current_dag_id = 'mr_google_search_data_collection'
 
-    historical_df[date_column] = pd.to_datetime(historical_df[date_column])
-    current_df[date_column] = pd.to_datetime(current_df[date_column])
+dag = DAG(
+    current_dag_id,
+    start_date=datetime(2024, 8, 27),
+    default_args=default_args,
+    schedule_interval=None,
+    catchup=False
+)
 
-    current_month = current_df[date_column].max()
+def init_task_callable(ti, **context):
+    print(f"context: {context}")
+    return ''
 
-    historical_filtered = historical_df[
-        historical_df[date_column] < current_month
-    ].sort_values(date_column)
+# BRANCH
+def search_dc_task_init_callable(ti, **context):
+    config = context['params']
+    category = config['category'][0]
 
-    last_n_months = (
-        historical_filtered
-        .groupby(key_columns)
-        .tail(window)
-    )
-
-    extrapolated_df = (
-        last_n_months
-        .groupby(key_columns)[value_column]
-        .mean()
-        .reset_index()
-    )
-
-    extrapolated_df[date_column] = current_month
-    extrapolated_df["project"] = current_df["project"].unique()[0]
-
-    total_extrapolated = extrapolated_df[value_column].sum()
-    total_actual = current_df[value_column].sum()
-
-    print("Total Extrapolated:", total_extrapolated)
-    print("Total Actual:", total_actual)
-
-    if total_extrapolated >= total_actual:
-        print("Using Extrapolated Data")
-        return extrapolated_df
+    if category.lower() in [x.lower() for x in SPECIAL_CATEGORIES]:
+        return 'dc_search_overlap_task'
     else:
-        print("Using Actual Current Month Data")
-        return current_df
+        return 'dc_search_task'
 
 
+# SEARCH TASK
+def search_dc_task_callable(ti, **context):
+    task_id = context['task'].task_id
+    dag_run_id = context['dag_run'].run_id
+    config = copy.deepcopy(context['params'])
+
+    default_start_date = '2014-01-01'
+    timeframe = config['timeframe']
+    end_date = timeframe[0].split(' ')[1]
+
+    config.update({
+        "threads": 5,
+        "timeframe": [f"{default_start_date} {end_date}"],
+        "task_id": task_id,
+        "dag_run_id": dag_run_id,
+        "dag_id": current_dag_id
+    })
+
+    s = dc_search_google(config)
+
+    # Run existing logic
+    s.start_process()
+
+    # NEW SAFE HELPER METHOD
+    current_df = s.get_final_dataframe()
+
+    if not current_df.empty:
+        ti.xcom_push(key="current_df", value=current_df.to_json())
+
+
+def search_dc_overlap_task_callable(ti, **context):
+
+    task_id = context['task'].task_id
+    dag_run_id = context['dag_run'].run_id
+    config = copy.deepcopy(context['params'])
+
+    default_start_date = '2014-01-01'
+    timeframe = config['timeframe']
+    end_date = timeframe[0].split(' ')[1]
+
+    config.update({
+        "threads": 5,
+        "timeframe": [f"{default_start_date} {end_date}"],
+        "task_id": task_id,
+        "dag_run_id": dag_run_id,
+        "dag_id": current_dag_id
+    })
+
+    s = dc_search_google_overlap(config)
+
+    s.start_process()
+
+    current_df = s.get_final_dataframe()
+
+    if not current_df.empty:
+        ti.xcom_push(key="current_df", value=current_df.to_json())
+
+
+# UPLOAD TRIGGER
+def search_dc_upload_trigger_task_callable(ti, **context):
+
+    task_id = context['task'].task_id
+    dag_run_id = context['dag_run'].run_id
+    config = copy.deepcopy(context['params'])
+
+    default_start_date = '2014-01-01'
+    timeframe = config['timeframe']
+    end_date = timeframe[0].split(' ')[1]
+
+    config.update({
+        "threads": 5,
+        "timeframe": [f"{default_start_date} {end_date}"],
+        "task_id": task_id,
+        "dag_run_id": dag_run_id,
+        "dag_id": current_dag_id
+    })
+
+    category = config['category'][0]
+
+    if category.lower() in [x.lower() for x in SPECIAL_CATEGORIES]:
+        s = dc_search_google_overlap(config)
+        s.upload_trigger()
+    else:
+        s = dc_search_google(config)
+        s.upload_trigger()
+
+def search_dc_extrapolation_task_callable(ti, **context):
+
+    config = context['params']
+    folder_name = config['folder_name']
+    country = config['country'][0]
+    category = config['category'][0]
+    lens = config['lens'][0]
+
+    bucket = "aipalette-retail-products"
+    key = f"{folder_name}/{country.replace(' ','_')}_{category.replace(' ','_')}_{lens}.csv"
+
+    s3 = boto3.client("s3")
+
+    # Historical data from S3
+    historical_df = load_historical_from_s3(s3, bucket, key)
+    historical_df['timestamp'] = pd.to_datetime(historical_df['timestamp'])
+
+    # Current DF from XCom
+    current_df_json = ti.xcom_pull(
+        task_ids=['dc_search_task', 'dc_search_overlap_task'],
+        key="current_df"
+    )
+
+    current_df_json = [x for x in current_df_json if x is not None][0]
+    current_df = pd.read_json(current_df_json)
+    current_df['timestamp'] = pd.to_datetime(current_df['timestamp'])
+
+    # Extrapolation
+    final_month_df = extrapolate_and_compare(
+        current_df=current_df,
+        historical_df=historical_df,
+        date_column="timestamp",
+        value_column="monthly_engagement_score",
+        key_columns=[lens]
+    )
+
+    current_month = final_month_df['timestamp'].max()
+
+    historical_df = historical_df[
+        historical_df['timestamp'] != current_month
+    ]
+
+    final_df = pd.concat([historical_df, final_month_df], ignore_index=True)
+
+    csv_buffer = StringIO()
+    final_df.to_csv(csv_buffer, index=False)
+
+    s3.put_object(Bucket=bucket, Key=key, Body=csv_buffer.getvalue())
+
+
+def search_dc_qa_task_callable(ti, **context):
+
+    config = copy.deepcopy(context['params'])
+
+    time_frame = config['timeframe'][0]
+    start_date, end_date = time_frame.split(' ')
+
+    config.update({
+        'start_date': start_date,
+        'end_date': end_date
+    })
+
+    dc_search_qa(config)
+
+
+init_task = PythonOperator(
+    task_id='init_task',
+    provide_context=True,
+    python_callable=init_task_callable,
+    dag=dag
+)
+
+dc_search_branch_operator = BranchPythonOperator(
+    task_id='dc_search_branch_operator',
+    provide_context=True,
+    python_callable=search_dc_task_init_callable,
+    dag=dag
+)
+
+dc_search_task = PythonOperator(
+    task_id='dc_search_task',
+    provide_context=True,
+    python_callable=search_dc_task_callable,
+    dag=dag
+)
+
+dc_search_overlap_task = PythonOperator(
+    task_id='dc_search_overlap_task',
+    provide_context=True,
+    python_callable=search_dc_overlap_task_callable,
+    dag=dag
+)
+
+search_dc_upload_trigger_task = PythonOperator(
+    task_id='search_dc_upload_trigger_task',
+    provide_context=True,
+    python_callable=search_dc_upload_trigger_task_callable,
+    dag=dag,
+    trigger_rule="none_failed_min_one_success"
+)
+
+dc_search_extrapolation_task = PythonOperator(
+    task_id='dc_search_extrapolation_task',
+    provide_context=True,
+    python_callable=search_dc_extrapolation_task_callable,
+    dag=dag,
+    trigger_rule="none_failed_min_one_success"
+)
+
+dc_search_qa_task = PythonOperator(
+    task_id='dc_search_qa_task',
+    provide_context=True,
+    python_callable=search_dc_qa_task_callable,
+    dag=dag,
+    trigger_rule="none_failed_min_one_success"
+)
+
+init_task >> dc_search_branch_operator >> [
+    dc_search_task, dc_search_overlap_task
+] >> search_dc_upload_trigger_task >> dc_search_extrapolation_task >> dc_search_qa_task

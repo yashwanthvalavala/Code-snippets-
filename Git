@@ -1,1 +1,0 @@
-ssh -i ~/.ssh/bitbucket_rsa -T git@bitbucket.org

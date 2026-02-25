@@ -1,0 +1,14 @@
+import boto3
+
+def count_s3_csv(bucket, prefix):
+    s3 = boto3.client('s3')
+    response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+
+    csv_files = [obj['Key'] for obj in response.get('Contents', []) if obj['Key'].endswith('.csv')]
+
+    print(f"Total CSV files in S3: {len(csv_files)}")
+    return len(csv_files)
+
+bucket_name = "aipalette-retail-products"
+folder_prefix = "your/folder/path/"
+count_s3_csv(bucket_name, folder_prefix)

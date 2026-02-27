@@ -1,0 +1,208 @@
+import boto3
+import pandas as pd
+import time
+from io import StringIO
+
+# ===============================
+# AWS CONFIG
+# ===============================
+aws_access_key_id = ""
+aws_secret_access_key = ""
+region_name = "ap-southeast-1"
+
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=aws_access_key_id,
+    aws_secret_access_key=aws_secret_access_key,
+    region_name=region_name
+)
+
+BUCKET = "aipalette-retail-products"
+
+# Folder paths (WILL BE PROVIDED)
+PREVIOUS_MONTH_PREFIX = "google_search_previous_month/"
+CURRENT_MONTH_PREFIX = "google_search_current_month/"
+OUTPUT_PREFIX = "google_search_extrapolated_output/"
+
+# Example BPC dashboards input
+# (Country, Category)
+BPC_DASHBOARDS = [
+    ("India", "Skincare"),
+    ("USA", "Ready-to-Eat")
+]
+
+
+# ===============================
+# EXTRAPOLATION LOGIC (DO NOT CHANGE)
+# ===============================
+def extrapolate(previous_df, current_df, file_name):
+
+    print("\n------------------------------------")
+    print("Processing:", file_name)
+
+    previous_df = previous_df.copy()
+    current_df = current_df.copy()
+
+    previous_df["timestamp"] = pd.to_datetime(previous_df["timestamp"], errors="coerce")
+    current_df["timestamp"] = pd.to_datetime(current_df["timestamp"], errors="coerce")
+
+    previous_df = previous_df.dropna(subset=["timestamp"])
+    current_df = current_df.dropna(subset=["timestamp"])
+
+    if previous_df.empty or current_df.empty:
+        print("Empty dataset encountered")
+        return current_df
+
+    key_column = [
+        col for col in previous_df.columns
+        if col not in ["timestamp", "project", "monthly_engagement_score"]
+    ][0]
+
+    # Dynamically detect latest month from current file
+    current_month = current_df["timestamp"].max()
+    print("Detected Current Month:", current_month)
+
+    historical_df = previous_df.sort_values("timestamp")
+
+    historical_months = sorted(historical_df["timestamp"].unique())
+    print("Last 3 Historical Months Used:", historical_months[-3:])
+
+    # ===== Compute Mean =====
+    last_n = (
+        historical_df
+        .groupby(key_column)
+        .tail(3)
+    )
+
+    mean_df = (
+        last_n
+        .groupby(key_column)["monthly_engagement_score"]
+        .mean()
+        .reset_index()
+    )
+
+    mean_df["monthly_engagement_score"] = mean_df["monthly_engagement_score"].fillna(0.0)
+
+    # Build extrapolated month
+    extrapolated_df = mean_df.copy()
+    extrapolated_df["timestamp"] = current_month
+    extrapolated_df["project"] = current_df["project"].iloc[0]
+
+    extrapolated_df = extrapolated_df[previous_df.columns]
+
+    # Dataset A → previous + extrapolated
+    dataset_A = pd.concat(
+        [historical_df, extrapolated_df],
+        ignore_index=True
+    )
+
+    # Dataset B → previous + actual current
+    dataset_B = pd.concat(
+        [historical_df, current_df],
+        ignore_index=True
+    )
+
+    total_A = dataset_A["monthly_engagement_score"].sum()
+    total_B = dataset_B["monthly_engagement_score"].sum()
+
+    print("Total (Previous + Extrapolated):", round(total_A, 4))
+    print("Total (Previous + Actual):", round(total_B, 4))
+
+    if total_A >= total_B:
+        print("Using Extrapolated Dataset")
+        final_df = dataset_A
+    else:
+        print("Using Actual Dataset")
+        final_df = dataset_B
+
+    final_df = final_df.sort_values(
+        by=[key_column, "timestamp"]
+    ).reset_index(drop=True)
+
+    return final_df
+
+
+# ===============================
+# PROCESS BPC DASHBOARDS
+# ===============================
+def process_bpc_dashboards():
+
+    start = time.perf_counter()
+
+    for country, category in BPC_DASHBOARDS:
+
+        print("\n====================================")
+        print("Country:", country, "| Category:", category)
+        print("====================================")
+
+        # List current month files for this dashboard
+        response = s3.list_objects_v2(
+            Bucket=BUCKET,
+            Prefix=CURRENT_MONTH_PREFIX
+        )
+
+        all_files = response.get("Contents", [])
+
+        # Filter files for this country + category
+        dashboard_files = [
+            obj["Key"]
+            for obj in all_files
+            if obj["Key"].endswith(".csv")
+            and country.replace(" ", "_") in obj["Key"]
+            and category.replace(" ", "_") in obj["Key"]
+        ]
+
+        print("Total Lens Files Found:", len(dashboard_files))
+
+        for current_key in dashboard_files:
+
+            # Detect lens from filename
+            lens = current_key.split("__")[-1]
+
+            previous_key = current_key.replace(
+                CURRENT_MONTH_PREFIX,
+                PREVIOUS_MONTH_PREFIX
+            )
+
+            print("\nProcessing Lens File:", lens)
+
+            # Load previous month file
+            prev_obj = s3.get_object(Bucket=BUCKET, Key=previous_key)
+            previous_df = pd.read_csv(
+                StringIO(prev_obj["Body"].read().decode("utf-8"))
+            )
+
+            # Load current month file
+            curr_obj = s3.get_object(Bucket=BUCKET, Key=current_key)
+            current_df = pd.read_csv(
+                StringIO(curr_obj["Body"].read().decode("utf-8"))
+            )
+
+            final_df = extrapolate(previous_df, current_df, current_key)
+
+            # Write to output folder
+            output_key = current_key.replace(
+                CURRENT_MONTH_PREFIX,
+                OUTPUT_PREFIX
+            )
+
+            csv_buffer = StringIO()
+            final_df.to_csv(csv_buffer, index=False)
+
+            s3.put_object(
+                Bucket=BUCKET,
+                Key=output_key,
+                Body=csv_buffer.getvalue()
+            )
+
+            print("Saved to:", output_key)
+
+    end = time.perf_counter()
+    print("\nTotal Processing Time:", round(end - start, 4), "seconds")
+
+
+# ===============================
+# MAIN
+# ===============================
+if __name__ == "__main__":
+    process_bpc_dashboards()

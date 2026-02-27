@@ -1,0 +1,163 @@
+import boto3
+import pandas as pd
+import time
+from io import StringIO
+
+# ===============================
+# AWS CONFIG
+# ===============================
+aws_access_key_id = ""
+aws_secret_access_key = ""
+region_name = "ap-southeast-1"
+
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=aws_access_key_id,
+    aws_secret_access_key=aws_secret_access_key,
+    region_name=region_name
+)
+
+BUCKET = "aipalette-retail-products"
+
+previous_month = "google_search_automation_jan_tier1_complete_2026/"
+current_month = "google_search_automation_jan_tier2_3_complete_2026/"
+
+BPC_list = []
+
+
+def extrapolate(df, file_name):
+
+    print("\n------------------------------------")
+    print("Processing File:", file_name)
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+
+    if df.empty:
+        print("File empty after cleaning")
+        return df
+
+    # Detect key column dynamically
+    key_column = [
+        col for col in df.columns
+        if col not in ["timestamp", "project", "monthly_engagement_score"]
+    ][0]
+
+    current_month = df["timestamp"].max()
+    print("Detected Current Month:", current_month)
+
+    historical_df = df[df["timestamp"] < current_month].sort_values("timestamp")
+    current_month_df = df[df["timestamp"] == current_month]
+
+    if historical_df.empty:
+        print("No historical data found.")
+        return df
+
+    historical_months = sorted(historical_df["timestamp"].unique())
+    print("Last 3 Historical Months Used:", historical_months[-3:])
+
+    # ===== Compute Last 3 Month Mean =====
+    last_n = (
+        historical_df
+        .groupby(key_column)
+        .tail(3)
+    )
+
+    mean_df = (
+        last_n
+        .groupby(key_column)["monthly_engagement_score"]
+        .mean()
+        .reset_index()
+    )
+
+    mean_df["monthly_engagement_score"] = mean_df["monthly_engagement_score"].fillna(0.0)
+
+    # ===== Build Extrapolated Month =====
+    extrapolated_month_df = mean_df.copy()
+    extrapolated_month_df["timestamp"] = current_month
+    extrapolated_month_df["project"] = current_month_df["project"].iloc[0]
+
+    extrapolated_month_df = extrapolated_month_df[df.columns]
+
+    # ===== Dataset A =====
+    dataset_A = pd.concat(
+        [historical_df, extrapolated_month_df],
+        ignore_index=True
+    )
+
+    # ===== Dataset B (Original File) =====
+    dataset_B = df
+
+    total_A = dataset_A["monthly_engagement_score"].sum()
+    total_B = dataset_B["monthly_engagement_score"].sum()
+
+    print("Total (Historical + Extrapolated):", round(total_A, 4))
+    print("Total (Original Dataset):", round(total_B, 4))
+
+    if total_A >= total_B:
+        print("Using Extrapolated Dataset")
+        final_df = dataset_A
+    else:
+        print("Using Original Dataset")
+        final_df = dataset_B
+
+    # ===== Sort Final Output =====
+    final_df = final_df.sort_values(
+        by=[key_column, "timestamp"]
+    ).reset_index(drop=True)
+
+    return final_df
+
+
+def process_tier(prefix, country_list, tier_name):
+
+    print("\n==============================")
+    print("Processing", tier_name)
+    print("==============================")
+
+    start = time.perf_counter()
+
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+    all_files = response.get("Contents", [])
+
+    files = [
+        obj["Key"]
+        for obj in all_files
+        if obj["Key"].endswith(".csv")
+        and any(country + "_" in obj["Key"] for country in country_list)
+    ]
+
+    print("Total Files Found:", len(files))
+
+    for key in files:
+
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        df = pd.read_csv(StringIO(obj["Body"].read().decode("utf-8")))
+
+        final_df = extrapolate(df, key)
+
+        # csv_buffer = StringIO()
+        # final_df.to_csv(csv_buffer, index=False)
+        # s3.put_object(Bucket=BUCKET, Key=key, Body=csv_buffer.getvalue())
+
+    end = time.perf_counter()
+    total_time = round(end - start, 4)
+
+    print("Time taken for {}: {} seconds".format(tier_name, total_time))
+
+    return total_time
+
+
+if __name__ == "__main__":
+
+    tier1_ti = process_tier(TIER1_PREFIX, TIER1_COUNTRIES, "Tier 1")
+
+    combined_time = round(tier1_time + tier2_time, 4)
+
+    print("\n====================================")
+    print("FINAL SUMMARY")
+    print("====================================")
+    print("Tier 1 Time:", tier1_time, "seconds")
+    print("Tier 2 Time:", tier2_time, "seconds")
+    print("Combined Time:", combined_time, "seconds")

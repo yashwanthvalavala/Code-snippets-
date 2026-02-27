@@ -1,0 +1,215 @@
+import boto3
+import pandas as pd
+import time
+from io import StringIO
+
+# ===============================
+# AWS CONFIG
+# ===============================
+aws_access_key_id = ""
+aws_secret_access_key = ""
+region_name = "ap-southeast-1"
+
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=aws_access_key_id,
+    aws_secret_access_key=aws_secret_access_key,
+    region_name=region_name
+)
+
+BUCKET = "aipalette-retail-products"
+
+PREVIOUS_MONTH_PREFIX = "google_search_previous_month/"
+CURRENT_MONTH_PREFIX = "google_search_current_month/"
+OUTPUT_PREFIX = "google_search_extrapolated_output/"
+
+BPC_DASHBOARDS = [
+    ("India", "Skincare"),
+    ("USA", "Ready-to-Eat")
+]
+
+
+# ===============================
+# GROUPWISE EXTRAPOLATION
+# ===============================
+def extrapolate(previous_df, current_df, file_name):
+
+    print("\n------------------------------------")
+    print("Processing:", file_name)
+
+    previous_df = previous_df.copy()
+    current_df = current_df.copy()
+
+    previous_df["timestamp"] = pd.to_datetime(previous_df["timestamp"], errors="coerce")
+    current_df["timestamp"] = pd.to_datetime(current_df["timestamp"], errors="coerce")
+
+    previous_df = previous_df.dropna(subset=["timestamp"])
+    current_df = current_df.dropna(subset=["timestamp"])
+
+    if previous_df.empty or current_df.empty:
+        print("Empty dataset encountered")
+        return current_df
+
+    key_column = [
+        col for col in previous_df.columns
+        if col not in ["timestamp", "project", "monthly_engagement_score"]
+    ][0]
+
+    current_month = current_df["timestamp"].max()
+    print("Detected Current Month:", current_month)
+
+    historical_df = previous_df.sort_values("timestamp")
+    current_month_df = current_df[current_df["timestamp"] == current_month]
+
+    historical_months = sorted(historical_df["timestamp"].unique())
+    print("Last 3 Historical Months Used:", historical_months[-3:])
+
+    # ===== Compute Last 3 Month Mean Per Key =====
+    last_n = (
+        historical_df
+        .groupby(key_column)
+        .tail(3)
+    )
+
+    mean_df = (
+        last_n
+        .groupby(key_column)["monthly_engagement_score"]
+        .mean()
+        .reset_index()
+    )
+
+    mean_df["monthly_engagement_score"] = mean_df["monthly_engagement_score"].fillna(0.0)
+
+    # Merge mean with actual Jan
+    merged = pd.merge(
+        mean_df,
+        current_month_df[[key_column, "monthly_engagement_score"]],
+        on=key_column,
+        how="outer",
+        suffixes=("_mean", "_actual")
+    )
+
+    merged["monthly_engagement_score_mean"] = merged["monthly_engagement_score_mean"].fillna(0.0)
+    merged["monthly_engagement_score_actual"] = merged["monthly_engagement_score_actual"].fillna(0.0)
+
+    final_rows = []
+
+    # ===== GROUPWISE DECISION =====
+    for _, row in merged.iterrows():
+
+        key_val = row[key_column]
+
+        hist_subset = historical_df[historical_df[key_column] == key_val]
+
+        # Dataset A (historical + extrapolated)
+        total_A = hist_subset["monthly_engagement_score"].sum() + row["monthly_engagement_score_mean"]
+
+        # Dataset B (historical + actual)
+        total_B = hist_subset["monthly_engagement_score"].sum() + row["monthly_engagement_score_actual"]
+
+        if total_A >= total_B:
+            chosen_value = row["monthly_engagement_score_mean"]
+        else:
+            chosen_value = row["monthly_engagement_score_actual"]
+
+        final_rows.append({
+            key_column: key_val,
+            "monthly_engagement_score": chosen_value,
+            "timestamp": current_month,
+            "project": current_month_df["project"].iloc[0]
+        })
+
+    final_month_df = pd.DataFrame(final_rows)
+
+    # Maintain original column order
+    final_month_df = final_month_df[previous_df.columns]
+
+    # Append to historical
+    final_df = pd.concat(
+        [historical_df, final_month_df],
+        ignore_index=True
+    )
+
+    final_df = final_df.sort_values(
+        by=[key_column, "timestamp"]
+    ).reset_index(drop=True)
+
+    return final_df
+
+
+# ===============================
+# PROCESS BPC DASHBOARDS
+# ===============================
+def process_bpc_dashboards():
+
+    start = time.perf_counter()
+
+    for country, category in BPC_DASHBOARDS:
+
+        print("\n====================================")
+        print("Country:", country, "| Category:", category)
+        print("====================================")
+
+        response = s3.list_objects_v2(
+            Bucket=BUCKET,
+            Prefix=CURRENT_MONTH_PREFIX
+        )
+
+        all_files = response.get("Contents", [])
+
+        dashboard_files = [
+            obj["Key"]
+            for obj in all_files
+            if obj["Key"].endswith(".csv")
+            and country.replace(" ", "_") in obj["Key"]
+            and category.replace(" ", "_") in obj["Key"]
+        ]
+
+        print("Total Lens Files Found:", len(dashboard_files))
+
+        for current_key in dashboard_files:
+
+            previous_key = current_key.replace(
+                CURRENT_MONTH_PREFIX,
+                PREVIOUS_MONTH_PREFIX
+            )
+
+            print("\nProcessing Lens:", current_key.split("__")[-1])
+
+            prev_obj = s3.get_object(Bucket=BUCKET, Key=previous_key)
+            previous_df = pd.read_csv(
+                StringIO(prev_obj["Body"].read().decode("utf-8"))
+            )
+
+            curr_obj = s3.get_object(Bucket=BUCKET, Key=current_key)
+            current_df = pd.read_csv(
+                StringIO(curr_obj["Body"].read().decode("utf-8"))
+            )
+
+            final_df = extrapolate(previous_df, current_df, current_key)
+
+            output_key = current_key.replace(
+                CURRENT_MONTH_PREFIX,
+                OUTPUT_PREFIX
+            )
+
+            csv_buffer = StringIO()
+            final_df.to_csv(csv_buffer, index=False)
+
+            s3.put_object(
+                Bucket=BUCKET,
+                Key=output_key,
+                Body=csv_buffer.getvalue()
+            )
+
+            print("Saved to:", output_key)
+
+    end = time.perf_counter()
+    print("\nTotal Processing Time:", round(end - start, 4), "seconds")
+
+
+# ===============================
+# MAIN
+# ===============================
+if __name__ == "__main__":
+    process_bpc_dashboards()

@@ -1,0 +1,16 @@
+Host 10.3.89.23
+    HostName 10.3.89.23
+    User ubuntu
+
+Host new-ui-ux
+    HostName 10.3.86.183
+    User root
+
+Host new-ui-ux-copy-gagan-pem
+    HostName 10.3.95.106
+    User ubuntu
+    IdentityFile ~/.ssh/ai-internal.pem
+
+Host vm-data-copy
+    HostName 10.3.10.136
+    User ubuntu
